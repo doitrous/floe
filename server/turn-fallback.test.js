@@ -12,13 +12,53 @@ const { describe, it, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('crypto');
 
+// The premise of this file (no Cloudflare keys, no coturn secret) is made true
+// here instead of assumed. turn.js reads the Cloudflare pair at require time,
+// so with it set every turnCredentialsHandler call below would mint a real
+// credential over the network with a real API token; with the coturn pair set,
+// 'returns null when both are unset' would fail.
+delete process.env.CLOUDFLARE_TURN_KEY_ID;
+delete process.env.CLOUDFLARE_TURN_KEY_API_TOKEN;
+delete process.env.TURN_SECRET;
+delete process.env.TURN_DOMAIN;
+
+// Nothing in this file may reach the network: any fetch fails loudly and is
+// counted, so a removed guard shows up as a failure instead of a silent mint.
+let fetchCalls = 0;
+globalThis.fetch = async () => {
+    fetchCalls++;
+    throw new Error('turn-fallback.test.js: unexpected network call');
+};
+
 const {
     STUN_FALLBACK,
     turnRateLimits,
     TURN_MAX_REQUESTS,
+    generateCloudflareIceServers,
     generateCoturnCredentials,
     turnCredentialsHandler,
 } = require('./turn');
+
+// Tests set TURN_SECRET and TURN_DOMAIN at run time; each one gets back the
+// values it started with (unset, after the deletes above) instead of a blind
+// delete.
+let savedTurnEnv = {};
+function saveTurnEnv() {
+    savedTurnEnv = { TURN_SECRET: process.env.TURN_SECRET, TURN_DOMAIN: process.env.TURN_DOMAIN };
+}
+function restoreTurnEnv() {
+    for (const [key, value] of Object.entries(savedTurnEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+    }
+}
+
+describe('the no-Cloudflare premise', () => {
+    it('generateCloudflareIceServers returns null and never calls fetch', async () => {
+        assert.equal(await generateCloudflareIceServers(), null);
+        assert.equal(fetchCalls, 0);
+    });
+});
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -38,10 +78,8 @@ function fakeRes() {
 // ---------------------------------------------------------------------------
 
 describe('generateCoturnCredentials', () => {
-    afterEach(() => {
-        delete process.env.TURN_SECRET;
-        delete process.env.TURN_DOMAIN;
-    });
+    beforeEach(saveTurnEnv);
+    afterEach(restoreTurnEnv);
 
     it('returns null when TURN_SECRET is unset', () => {
         process.env.TURN_DOMAIN = 'turn.example.com';
@@ -113,11 +151,8 @@ describe('generateCoturnCredentials', () => {
 // ---------------------------------------------------------------------------
 
 describe('turnCredentialsHandler — without Cloudflare', () => {
-    beforeEach(() => { turnRateLimits.clear(); });
-    afterEach(() => {
-        delete process.env.TURN_SECRET;
-        delete process.env.TURN_DOMAIN;
-    });
+    beforeEach(() => { turnRateLimits.clear(); saveTurnEnv(); });
+    afterEach(restoreTurnEnv);
 
     it('returns STUN_FALLBACK when no TURN provider is configured', async () => {
         const res = fakeRes();
@@ -165,5 +200,9 @@ describe('turnCredentialsHandler — without Cloudflare', () => {
         const res = fakeRes();
         await turnCredentialsHandler({ ip: '2001:db8:1:2:ffff::1' }, res);
         assert.equal(res.statusCode, 429, 'same /64 shares the budget');
+    });
+
+    it('no handler call above reached the network', () => {
+        assert.equal(fetchCalls, 0);
     });
 });
