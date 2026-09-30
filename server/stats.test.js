@@ -6,6 +6,21 @@
 const { describe, it, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 
+// The "Upstash is not configured" premise is made true here instead of
+// assumed. stats.js reads both keys at require time, so on a machine or CI job
+// that has them set, initStats() and every accepted report below would call
+// the real counter with a real credential.
+delete process.env.UPSTASH_REDIS_REST_URL;
+delete process.env.UPSTASH_REDIS_REST_TOKEN;
+
+// Nothing in this file may reach the network: any fetch fails loudly and is
+// counted, so a removed guard shows up as a failure instead of a live call.
+let fetchCalls = 0;
+globalThis.fetch = async () => {
+    fetchCalls++;
+    throw new Error('stats.test.js: unexpected network call');
+};
+
 const {
     statsRateLimits,
     STATS_MAX_REPORTS,
@@ -39,10 +54,14 @@ function getTotal() {
 // ---------------------------------------------------------------------------
 
 describe('statsHandler', () => {
-    it('returns totalBytes as a number', () => {
+    it('returns the running total after a report', () => {
+        statsRateLimits.clear();
+        const before = getTotal();
+        assert.equal(typeof before, 'number');
+        statsReportHandler({ ip: '1.2.3.4', body: { bytes: 7 } }, fakeRes());
         const res = fakeRes();
         statsHandler({}, res);
-        assert.equal(typeof res.body.totalBytes, 'number');
+        assert.equal(res.body.totalBytes, before + 7);
     });
 });
 
@@ -194,6 +213,23 @@ describe('statsReportHandler', () => {
         assert.equal(getTotal(), before);
     });
 
+    it('counts an invalid report against the limiter (the limiter runs before validation)', () => {
+        // One invalid report uses a slot, so the limiter trips one valid
+        // report earlier. Swapping the two blocks in statsReportHandler turns
+        // the last request below into a 200.
+        const first = fakeRes();
+        statsReportHandler({ ip: '10.0.0.7', body: { bytes: -1 } }, first);
+        assert.equal(first.statusCode, 400);
+        for (let i = 0; i < STATS_MAX_REPORTS - 1; i++) {
+            const res = fakeRes();
+            statsReportHandler({ ip: '10.0.0.7', body: { bytes: 1 } }, res);
+            assert.equal(res.statusCode, 200, `valid report ${i + 1} should pass`);
+        }
+        const res = fakeRes();
+        statsReportHandler({ ip: '10.0.0.7', body: { bytes: 1 } }, res);
+        assert.equal(res.statusCode, 429, 'the invalid report used a slot');
+    });
+
     it('does not increment the total on a rate-limited report', () => {
         for (let i = 0; i < STATS_MAX_REPORTS; i++) {
             statsReportHandler({ ip: '10.0.0.5', body: { bytes: 1 } }, fakeRes());
@@ -209,7 +245,12 @@ describe('statsReportHandler', () => {
 // ---------------------------------------------------------------------------
 
 describe('initStats', () => {
-    it('resolves without throwing when Upstash is not configured', async () => {
+    it('resolves without throwing or any network call when Upstash is not configured', async () => {
         await assert.doesNotReject(initStats());
+        assert.equal(fetchCalls, 0, 'initStats must not call fetch without the Upstash keys');
+    });
+
+    it('no accepted report above reached the network', () => {
+        assert.equal(fetchCalls, 0);
     });
 });
